@@ -1,0 +1,183 @@
+# File: hashpsi.mpc
+from Compiler.library import *
+from Compiler.types import sint, regint, sfix
+import math
+
+# ================= 全局配置 =================
+MAX_SIZE = 10000
+# 动态分桶参数
+MAX_BUCKETS = 100  # 桶数量上限（物理内存按这个分配）
+BUCKET_CAPACITY = 20 # 单个桶的预分配容量
+
+program.use_split(2)
+
+def main():
+    # 强制定点数使用四舍五入，避免概率截断警告
+    sfix.round_nearest = True
+
+    # ================= 1. 全局配置参数 =================
+    EPSILON = 1.0
+    DELTA_MAX = 0.2
+    THRESHOLD = 30
+    LAMBDA = 50.0
+    BETA = 0.05
+
+    print_ln("========================================")
+    print_ln("Optimized MPC-DP PSI (Dynamic Hash Bucketing)")
+    print_ln("Rule: 1 bucket per 10 items, Max 100 buckets")
+    print_ln("========================================")
+
+    # ================= 2. 动态输入与边界检查 =================
+    actual_n_p0 = sint.get_input_from(0)
+    actual_n_p1 = sint.get_input_from(1)
+    n_p0_public = actual_n_p0.reveal()
+    n_p1_public = actual_n_p1.reveal()
+    
+    n_p0_safe = n_p0_public.min(MAX_SIZE)
+    n_p1_safe = n_p1_public.min(MAX_SIZE)
+
+    # ================= 3. 动态计算桶数量（运行时逻辑变量） =================
+    # 规则：每 10 条数据分 1 个桶，上限 100 个，最少 1 个
+    total_data = regint(n_p0_safe.reveal()) + regint(n_p1_safe.reveal())
+    dynamic_num_buckets = regint.max(1, regint.min(MAX_BUCKETS, total_data // 10))
+    
+    print_ln("Actual P0 size: %s, P1 size: %s", n_p0_safe, n_p1_safe)
+    print_ln("Dynamic calculated NUM_BUCKETS (Logical): %s", dynamic_num_buckets)
+
+    # ================= 4. 动态读取数据 =================
+    ids_p0 = Array(MAX_SIZE, sint)
+    ids_p1 = Array(MAX_SIZE, sint)
+    
+    @for_range(n_p0_safe)
+    def _(i):
+        ids_p0[i] = sint.get_input_from(0)
+    
+    @for_range(n_p1_safe)
+    def _(i):
+        ids_p1[i] = sint.get_input_from(1)
+
+    # ================= 5. 哈希分桶预处理 =================
+    # 物理内存必须按 MAX_BUCKETS 预分配，不能用运行时变量
+    bucket_p0 = Array(MAX_BUCKETS * BUCKET_CAPACITY, sint)
+    bucket_p1 = Array(MAX_BUCKETS * BUCKET_CAPACITY, sint)
+    # 记录每个桶当前的实际填充长度
+    bucket_len_p0 = Array(MAX_BUCKETS, regint)
+    bucket_len_p1 = Array(MAX_BUCKETS, regint)
+    bucket_len_p0.assign_all(0)
+    bucket_len_p1.assign_all(0)
+
+    print_ln("Distributing data into buckets...")
+
+    # 将 P0 数据放入桶中
+    @for_range(n_p0_safe)
+    def _(i):
+        val = ids_p0[i]
+        # 根据动态桶数量进行取模分桶
+        bucket_idx = (val.reveal() % dynamic_num_buckets).reveal()
+        current_len = bucket_len_p0[bucket_idx]
+        # 存入数据
+        bucket_p0[bucket_idx * BUCKET_CAPACITY + current_len] = val
+        # 桶长度 +1
+        bucket_len_p0[bucket_idx] = current_len + 1
+
+    # 将 P1 数据放入桶中
+    @for_range(n_p1_safe)
+    def _(i):
+        val = ids_p1[i]
+        bucket_idx = (val.reveal() % dynamic_num_buckets).reveal()
+        current_len = bucket_len_p1[bucket_idx]
+        bucket_p1[bucket_idx * BUCKET_CAPACITY + current_len] = val
+        bucket_len_p1[bucket_idx] = current_len + 1
+
+    # ================= 6. 分桶内局部求交 (PSI) =================
+    total_intersection = sint(0)
+
+    print_ln("Computing intersection within buckets...")
+
+    # 使用 @for_range_opt 解决闭包变量捕获问题
+    @for_range_opt(MAX_BUCKETS)
+    def _(b):
+        # 判断当前桶索引 b 是否在动态计算的有效范围内
+        is_valid_bucket_idx = sint(regint(b) < dynamic_num_buckets)
+        
+        len_p0 = sint(bucket_len_p0[b])
+        len_p1 = sint(bucket_len_p1[b])
+        
+        # 必须同时满足：1. 桶索引在动态范围内 2. 两个桶内都有数据
+        is_valid_bucket = is_valid_bucket_idx * (len_p0 > sint(0)) * (len_p1 > sint(0))
+        
+        bucket_matches = sint(0)
+
+        # 桶内双重循环对比，同样使用 @for_range_opt
+        @for_range_opt(BUCKET_CAPACITY)
+        def _(i):
+            @for_range_opt(BUCKET_CAPACITY)
+            def _(j):
+                # 越界保护 + 逻辑有效性保护
+                in_range = (sint(i) < len_p0) * (sint(j) < len_p1)
+                is_match = (bucket_p0[b * BUCKET_CAPACITY + i] == bucket_p1[b * BUCKET_CAPACITY + j])
+                # 只有当桶有效、索引在范围内、且值相等时，才计入匹配
+                match_contribution = is_match * in_range * is_valid_bucket
+                # 使用 .update() 方法进行累加
+                bucket_matches.update(bucket_matches + match_contribution)
+
+        # 将当前桶的匹配数累加到总交集，同样使用 .update()
+        total_intersection.update(total_intersection + bucket_matches)
+
+    print_ln("Exact intersection size: %s", total_intersection.reveal())
+
+    # ================= 7. 自适应平滑敏感度计算 =================
+    diff = total_intersection - sint(THRESHOLD)
+    abs_diff = (diff >= sint(0)).if_else(diff, -diff)
+    D_MAX = math.ceil(4.60517 / BETA)
+    
+    safe_d = (abs_diff < sint(D_MAX)).if_else(abs_diff, sint(D_MAX))
+    norm_d_sfix = sfix(safe_d) / sfix(D_MAX)
+    one_minus_norm = sfix(1) - norm_d_sfix
+    decay_sfix = one_minus_norm * sfix(LAMBDA - 1)
+    decay_val = sint(decay_sfix)
+    decay_val = (decay_val >= sint(0)).if_else(decay_val, sint(0))
+    smooth_sensitivity = sint(1) + decay_val
+
+    # ================= 8. 生成自适应噪声 =================
+    scale_factor = 100
+    epsilon_scaled = int(EPSILON * scale_factor)
+    temp_sfix = sfix(smooth_sensitivity * scale_factor)
+    noise_scale_scaled = sint(temp_sfix / epsilon_scaled)
+    noise_scale_scaled = (noise_scale_scaled >= 1).if_else(noise_scale_scaled, sint(1))
+    
+    range_val = noise_scale_scaled * 3
+    rand_fix = sfix.get_random(0, 1)
+    noise_sfix = (rand_fix - sfix(0.5)) * sfix(2) * sfix(range_val)
+    noise = sint(noise_sfix)
+
+    # ================= 9. 最终输出与可用性判定 =================
+    noisy_count = total_intersection + noise
+    
+    target_K = (EPSILON * DELTA_MAX) / math.sqrt(2)
+    N_min = THRESHOLD
+    found = False
+    for n in range(THRESHOLD, THRESHOLD + 500):
+        d = n - THRESHOLD
+        s_star = 1.0 + (LAMBDA - 1.0) * math.exp(-BETA * d)
+        current_ratio = s_star / n
+        if current_ratio <= target_K:
+            N_min = n
+            found = True
+            break
+    if not found:
+        N_min = THRESHOLD + 500
+
+    is_usable = (noisy_count >= sint(N_min))
+    
+    print_ln("========================================")
+    print_ln("FINAL RESULTS:")
+    print_ln("Exact intersection: %s", total_intersection.reveal())
+    print_ln("Noisy intersection: %s", noisy_count.reveal())
+    print_ln("Is Usable (>= N_min): %s", is_usable.reveal())
+    
+    final_output = is_usable.if_else(noisy_count, sint(0))
+    print_ln("Final Output: %s", final_output.reveal())
+    print_ln("========================================")
+
+main()
