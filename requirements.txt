@@ -1,0 +1,26 @@
+# ==========================================
+# AdaHash-FewShot-PSI Python Dependencies
+# ==========================================
+
+# --- 基础科学计算库 (用于数据处理、矩阵运算) ---
+numpy>=1.20.0
+scipy>=1.7.0
+
+# --- 密码学与安全相关 (如果使用了特定的Python加密库) ---
+# gmpy2  # 如果需要大数运算加速 (可选)
+# pycryptodome # 如果用了AES/RSA等辅助加密 (可选)
+
+# --- 实用工具 ---
+tqdm       # 用于显示进度条 (测试脚本中常用)
+argparse   # 用于解析命令行参数 (通常Python自带，写上更明确)
+
+# ==========================================
+# ⚠️ 重要提示 / IMPORTANT NOTE
+# ==========================================
+# 本项目的核心 MPC 协议运行依赖于 MP-SPDZ 框架。
+# MP-SPDZ 无法通过 pip 安装，请参照 MP-SPDZ 官方文档进行源码编译。
+#
+# Core MPC protocol relies on the MP-SPDZ framework.
+# MP-SPDZ cannot be installed via pip. Please compile from source
+# following the official MP-SPDZ documentation.
+# ==========================================
